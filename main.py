@@ -9,14 +9,23 @@ import os
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from fastapi.responses import JSONResponse
+import json
+import psycopg2
 
 load_dotenv()
 app = FastAPI(title="DevBuddy MCP Server")
 
 # API credentials
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
+NEON_DSN = os.getenv("NEON_DSN")  # e.g., postgres://user:pass@host.neon.tech/db
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+
+# Neon DB connection
+neon_conn = psycopg2.connect(NEON_DSN)
+neon_cursor = neon_conn.cursor()
+neon_cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, user_id VARCHAR, task VARCHAR, status VARCHAR, created_at TIMESTAMP)''')
+neon_conn.commit()
 
 def get_calendar_service():
     creds = None
@@ -32,6 +41,148 @@ def get_calendar_service():
             token_file.write(creds.to_json())
     return build('calendar', 'v3', credentials=creds)
 
+
+@app.post("/mcp")
+async def mcp_endpoint(request: dict):
+    if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "method" not in request:
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": request.get("id")}
+        )
+
+    method = request.get("method")
+    params = request.get("params", {})
+    request_id = request.get("id")
+
+    # Define available tools
+    tools = [
+        {"name": "code_review", "description": "Analyzes GitHub PR for code quality", "parameters": {"pr_id": "string", "repo": "string"}},
+        {"name": "learn_path", "description": "Generates learning path for a skill", "parameters": {"skill": "string"}},
+        {"name": "task_remind", "description": "Creates Google Calendar task reminder", "parameters": {"task": "string", "user_id": "string"}},
+        {"name": "client_analyze", "description": "Extracts deliverables from client document", "parameters": {"content": "string"}}
+    ]
+
+    # Define resources (e.g., task history in Neon DB)
+    resources = [
+        {"name": "task_history", "description": "Stored task history from Neon DB", "type": "database"}
+    ]
+
+    # Define prompts
+    prompts = [
+        {"name": "code_review_prompt", "description": "Prompt for analyzing PR descriptions"},
+        {"name": "client_analyze_prompt", "description": "Prompt for extracting deliverables from documents"}
+    ]
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "result": tools, "id": request_id}
+
+    if method == "tools/call":
+        tool_name = params.get("tool")
+        tool_params = params.get("params", {})
+        
+        if tool_name == "code_review":
+            url = f"https://api.github.com/repos/{tool_params.get('repo')}/pulls/{tool_params.get('pr_id')}"
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                return JSONResponse(
+                    status_code=400,
+                    content={"jsonrpc": "2.0", "error": {"code": -32000, "message": "GitHub API error"}, "id": request_id}
+                )
+            pr_data = response.json()
+            body = pr_data.get("body", "") or "No description"
+            return {"jsonrpc": "2.0", "result": {"pr_id": tool_params.get("pr_id"), "repo": tool_params.get("repo"), "description": body}, "id": request_id}
+
+        elif tool_name == "learn_path":
+            url = f"https://api.github.com/search/repositories?q={tool_params.get('skill')}+language:{tool_params.get('skill')}"
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                return JSONResponse(
+                    status_code=400,
+                    content={"jsonrpc": "2.0", "error": {"code": -32000, "message": "GitHub API error"}, "id": request_id}
+                )
+            repos = response.json().get("items", [])[:3]
+            path = [repo['full_name'] for repo in repos]
+            service = get_calendar_service()
+            ist = ZoneInfo("Asia/Kolkata")
+            now = datetime.now(ist)
+            start_time = now + timedelta(minutes=30)
+            end_time = start_time + timedelta(hours=1)
+            event = {
+                'summary': f"Learn {tool_params.get('skill')}",
+                'description': f"Upskilling path: {', '.join(path)}",
+                'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
+                'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
+                'reminders': {'useDefault': True}
+            }
+            created_event = service.events().insert(calendarId='primary', body=event).execute()
+            return {"jsonrpc": "2.0", "result": {"skill": tool_params.get("skill"), "path": path, "event_link": created_event.get('htmlLink')}, "id": request_id}
+
+        elif tool_name == "task_remind":
+            service = get_calendar_service()
+            ist = ZoneInfo("Asia/Kolkata")
+            now = datetime.now(ist)
+            start_time = now + timedelta(minutes=30)
+            end_time = start_time + timedelta(hours=1)
+            event = {
+                'summary': tool_params.get("task"),
+                'description': f"Reminder for {tool_params.get('user_id')}",
+                'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
+                'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
+                'reminders': {'useDefault': True}
+            }
+            created_event = service.events().insert(calendarId='primary', body=event).execute()
+            neon_cursor.execute("INSERT INTO tasks (user_id, task, status, created_at) VALUES (%s, %s, %s, %s)", (tool_params.get("user_id"), tool_params.get("task"), "pending", now))
+            neon_conn.commit()
+            return {"jsonrpc": "2.0", "result": {"task": tool_params.get("task"), "event_link": created_event.get('htmlLink'), "neon_status": "Task stored in Neon DB"}, "id": request_id}
+
+        elif tool_name == "client_analyze":
+            content = tool_params.get("content", "")
+            return {"jsonrpc": "2.0", "result": {"content": content}, "id": request_id}
+
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": request_id}
+            )
+
+    if method == "resources/list":
+        return {"jsonrpc": "2.0", "result": resources, "id": request_id}
+
+    if method == "resources/read":
+        resource_name = params.get("name")
+        if resource_name == "task_history":
+            neon_cursor.execute("SELECT user_id, task, status, created_at FROM tasks ORDER BY created_at DESC LIMIT 10")
+            tasks = [{"user_id": row[0], "task": row[1], "status": row[2], "created_at": row[3].isoformat()} for row in neon_cursor.fetchall()]
+            return {"jsonrpc": "2.0", "result": {"tasks": tasks}, "id": request_id}
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "error": {"code": -32601, "message": "Resource not found"}, "id": request_id}
+        )
+
+    if method == "prompts/list":
+        return {"jsonrpc": "2.0", "result": prompts, "id": request_id}
+
+    if method == "prompts/get":
+        prompt_name = params.get("name")
+        for prompt in prompts:
+            if prompt["name"] == prompt_name:
+                return {"jsonrpc": "2.0", "result": prompt, "id": request_id}
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "error": {"code": -32601, "message": "Prompt not found"}, "id": request_id}
+        )
+
+    if method == "sampling/createMessage":
+        content = params.get("content", "")
+        return {"jsonrpc": "2.0", "result": {"message": f"Processed: {content[:100]}"}, "id": request_id}
+
+    return JSONResponse(
+        status_code=400,
+        content={"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": request_id}
+    )
+
 class ReviewQuery(BaseModel):
     pr_id: str
     repo: str
@@ -45,19 +196,7 @@ async def review_code(query: ReviewQuery):
         raise HTTPException(status_code=response.status_code, detail="GitHub API error")
     pr_data = response.json()
     body = pr_data.get("body", "") or "No description"
-    grok_url = "https://api.x.ai/v1/chat/completions"
-    grok_headers = {"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"}
-    grok_payload = {
-        "model": "grok-4",
-        "messages": [{"role": "user", "content": f"Review PR description for bugs and optimizations: {body[:500]}"}],
-        "stream": false,
-        "temperature": 0.7
-    }
-    grok_response = requests.post(grok_url, headers=grok_headers, json=grok_payload)
-    if grok_response.status_code != 200:
-        raise HTTPException(status_code=grok_response.status_code, detail=f"Grok API error: {grok_response.text}")
-    feedback = grok_response.json().get("choices", [{}])[0].get("message", {}).get("content", "No feedback")
-    return {"pr_id": query.pr_id, "repo": query.repo, "feedback": feedback}
+    return {"pr_id": query.pr_id, "repo": query.repo, "description": body}
 
 class LearnQuery(BaseModel):
     skill: str
@@ -105,24 +244,14 @@ async def send_reminder(query: TaskQuery):
         'reminders': {'useDefault': True}
     }
     created_event = service.events().insert(calendarId='primary', body=event).execute()
-    return {"task": query.task, "event_link": created_event.get('htmlLink')}
+    neon_cursor.execute("INSERT INTO tasks (user_id, task, status, created_at) VALUES (%s, %s, %s, %s)", (query.user_id, query.task, "pending", now))
+    neon_conn.commit()
+    return {"task": query.task, "event_link": created_event.get('htmlLink'), "neon_status": "Task stored in Neon DB"}
 
 @app.post("/client/analyze")
 async def analyze_doc(file: UploadFile = File(...)):
-    content = await file.read().decode('utf-8')
-    grok_url = "https://api.x.ai/v1/chat/completions"
-    grok_headers = {"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"}
-    grok_payload = {
-        "model": "grok-4",
-        "messages": [{"role": "user", "content": f"Extract deliverables from document: {content[:500]}"}],
-        "stream": False,
-        "temperature": 0.7
-    }
-    grok_response = requests.post(grok_url, headers=grok_headers, json=grok_payload)
-    if grok_response.status_code != 200:
-        raise HTTPException(status_code=grok_response.status_code, detail=f"Grok API error: {grok_response.text}")
-    deliverables = grok_response.json().get("choices", [{}])[0].get("message", {}).get("content", "No deliverables")
-    return {"deliverables": deliverables}
+    content = (await file.read()).decode('utf-8')
+    return {"content": content}
 
 class ProxyQuery(BaseModel):
     endpoint: str
@@ -134,5 +263,9 @@ async def mcp_proxy(query: ProxyQuery):
     headers = {"Content-Type": "application/json"}
     response = requests.post(internal_url, json=query.payload, headers=headers)
     if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=f"Internal API error: {response.text}")
+        raise HTTPException(status_code=response.status_code, detail="Internal API error")
     return response.json()
+
+@app.get("/mcp/proxy")
+async def mcp_proxy_health():
+    return {"status": "Proxy ready"}
